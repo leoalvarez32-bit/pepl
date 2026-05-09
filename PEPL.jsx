@@ -1,0 +1,1324 @@
+import React, { useState, useEffect, useMemo } from 'react';
+import {
+  Plus, Users, Lock, Unlock, CheckCircle2, XCircle, Trophy, LogIn,
+  Trash2, ChevronLeft, AlertCircle, Skull, Copy, Hash, Clock,
+  FileText, Crown, Play, Flag, Settings, AlertTriangle
+} from 'lucide-react';
+
+/* ============================================================
+   PRIVATE EVENT PREDICTION LEAGUE — PROTOTYPE
+   Implements PRD §1–§20 MVP scope.
+   Single-file React artifact, persistent via window.storage.
+   ============================================================ */
+
+// ---------- UTILITIES ----------
+const uid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
+const nowISO = () => new Date().toISOString();
+const inFuture = (mins) => new Date(Date.now() + mins * 60000).toISOString();
+const isLockedAt = (iso) => !iso ? false : new Date() >= new Date(iso);
+const fmtTime = (iso) => iso ? new Date(iso).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' }) : '—';
+const inviteCodeOf = (id) => id ? id.slice(0, 6).toUpperCase() : '';
+const STORAGE_KEY = 'pepl-state-v3';
+
+// MVP fixed rules — PRD §6.1 (not configurable)
+const MVP = {
+  STARTING_CREDITS: 100,
+  CREDIT_LOSS: 5,
+  ROUNDS_PER_SEASON: 6,
+};
+
+// ---------- INITIAL STATE ----------
+const emptyState = {
+  profiles: [],
+  leagues: [],
+  league_memberships: [],
+  seasons: [],
+  rounds: [],
+  events: [],
+  picks: [],
+  season_participants: [],
+  credit_ledger: [],
+  current_user_id: null,
+  view: 'dashboard',
+  active_league_id: null,
+  toast: null,
+};
+
+// ============================================================
+// MAIN APP
+// ============================================================
+export default function App() {
+  const [s, setS] = useState(emptyState);
+  const [loaded, setLoaded] = useState(false);
+  const [, setTick] = useState(0);
+
+  // re-render every 15s so lock states update visually
+  useEffect(() => {
+    const t = setInterval(() => setTick((x) => x + 1), 15000);
+    return () => clearInterval(t);
+  }, []);
+
+  // load persisted state once
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await window.storage.get(STORAGE_KEY);
+        if (r && r.value) setS({ ...emptyState, ...JSON.parse(r.value), toast: null });
+      } catch (_) { /* no saved state */ }
+      setLoaded(true);
+    })();
+  }, []);
+
+  // persist on every change
+  useEffect(() => {
+    if (!loaded) return;
+    const { toast, ...persistable } = s;
+    window.storage.set(STORAGE_KEY, JSON.stringify(persistable)).catch(() => {});
+  }, [s, loaded]);
+
+  // toast helper
+  const toast = (msg, kind = 'info') => {
+    setS((p) => ({ ...p, toast: { msg, kind, id: uid() } }));
+    setTimeout(() => setS((p) => (p.toast && p.toast.msg === msg ? { ...p, toast: null } : p)), 3000);
+  };
+
+  if (!loaded) {
+    return (
+      <div className="min-h-screen bg-stone-50 flex items-center justify-center font-mono text-xs text-stone-500">
+        loading state…
+      </div>
+    );
+  }
+
+  // ---------- ACTIONS ----------
+  const act = {
+    addUser: (display_name) => {
+      const id = uid();
+      setS((p) => ({
+        ...p,
+        profiles: [...p.profiles, { id, display_name, created_at: nowISO() }],
+        current_user_id: p.current_user_id || id,
+      }));
+      toast(`Created user "${display_name}"`);
+    },
+    switchUser: (id) => setS((p) => ({ ...p, current_user_id: id })),
+    resetAll: () => {
+      if (!confirm('Wipe all leagues, users, and history? This cannot be undone.')) return;
+      setS(emptyState);
+      toast('Reset complete', 'warn');
+    },
+
+    createLeague: ({ name, source_of_truth, description }) => {
+      if (!s.current_user_id) return toast('Add a user first', 'err');
+      const leagueId = uid();
+      const seasonId = uid();
+      const participantId = uid();
+      const membershipId = uid();
+      setS((p) => ({
+        ...p,
+        leagues: [...p.leagues, {
+          id: leagueId, name, admin_user_id: p.current_user_id,
+          source_of_truth, description, status: 'draft', created_at: nowISO(),
+        }],
+        league_memberships: [...p.league_memberships, {
+          id: membershipId, league_id: leagueId, user_id: p.current_user_id,
+          role: 'admin', joined_at: nowISO(),
+        }],
+        seasons: [...p.seasons, {
+          id: seasonId, league_id: leagueId, season_number: 1,
+          rounds_total: MVP.ROUNDS_PER_SEASON,
+          starting_credits: MVP.STARTING_CREDITS,
+          credit_loss_per_wrong_pick: MVP.CREDIT_LOSS,
+          status: 'not_started', start_date: null, end_date: null, created_at: nowISO(),
+        }],
+        season_participants: [...p.season_participants, {
+          id: participantId, season_id: seasonId, user_id: p.current_user_id,
+          credits_remaining: MVP.STARTING_CREDITS, wrong_picks_count: 0,
+          correct_picks_count: 0, is_eliminated: false, eliminated_at: null,
+          created_at: nowISO(),
+        }],
+        view: 'league',
+        active_league_id: leagueId,
+      }));
+      toast(`League "${name}" created`);
+    },
+
+    joinLeague: (rawCode) => {
+      if (!s.current_user_id) return toast('Add a user first', 'err');
+      const code = rawCode.trim().toUpperCase();
+      const league = s.leagues.find((l) => inviteCodeOf(l.id) === code);
+      if (!league) return toast('Invalid invite code', 'err');
+      const already = s.league_memberships.some((m) => m.league_id === league.id && m.user_id === s.current_user_id);
+      if (already) {
+        setS((p) => ({ ...p, view: 'league', active_league_id: league.id }));
+        return toast('Already a member — opening league');
+      }
+      // Find season to attach to (latest non-completed)
+      const seasons = s.seasons.filter((se) => se.league_id === league.id);
+      const targetSeason = seasons.find((se) => se.status !== 'completed') || seasons[0];
+      setS((p) => ({
+        ...p,
+        league_memberships: [...p.league_memberships, {
+          id: uid(), league_id: league.id, user_id: p.current_user_id,
+          role: 'member', joined_at: nowISO(),
+        }],
+        season_participants: targetSeason ? [...p.season_participants, {
+          id: uid(), season_id: targetSeason.id, user_id: p.current_user_id,
+          credits_remaining: MVP.STARTING_CREDITS, wrong_picks_count: 0,
+          correct_picks_count: 0, is_eliminated: false, eliminated_at: null,
+          created_at: nowISO(),
+        }] : p.season_participants,
+        view: 'league',
+        active_league_id: league.id,
+      }));
+      toast(`Joined "${league.name}"`);
+    },
+
+    startSeason: (seasonId) => {
+      setS((p) => ({
+        ...p,
+        seasons: p.seasons.map((se) =>
+          se.id === seasonId ? { ...se, status: 'in_progress', start_date: nowISO() } : se
+        ),
+        leagues: p.leagues.map((l) => {
+          const se = p.seasons.find((x) => x.id === seasonId);
+          return se && l.id === se.league_id ? { ...l, status: 'active' } : l;
+        }),
+      }));
+      toast('Season started');
+    },
+
+    createRound: (seasonId, { title, round_lock_at }) => {
+      const existing = s.rounds.filter((r) => r.season_id === seasonId);
+      const round_number = existing.length + 1;
+      setS((p) => ({
+        ...p,
+        rounds: [...p.rounds, {
+          id: uid(), season_id: seasonId, round_number, title,
+          status: 'open', picks_open_at: nowISO(),
+          round_lock_at: round_lock_at || null,
+          finalized_at: null, finalized_by_user_id: null, created_at: nowISO(),
+        }],
+      }));
+      toast(`Round ${round_number} created`);
+    },
+
+    createEvent: (roundId, { title, prompt, pick_lock_at }) => {
+      setS((p) => ({
+        ...p,
+        events: [...p.events, {
+          id: uid(), round_id: roundId, title, prompt,
+          start_time: nowISO(), pick_lock_at,
+          status: 'open', resolved_outcome: null,
+          resolved_by_user_id: null, resolved_at: null, created_at: nowISO(),
+        }],
+      }));
+      toast('Event created');
+    },
+
+    forceLockEvent: (eventId) => {
+      setS((p) => ({
+        ...p,
+        events: p.events.map((e) =>
+          e.id === eventId ? { ...e, pick_lock_at: nowISO(), status: 'locked' } : e
+        ),
+      }));
+      toast('Event locked');
+    },
+
+    submitPick: (eventId, choice) => {
+      const event = s.events.find((e) => e.id === eventId);
+      if (!event) return toast('Event not found', 'err');
+      if (isLockedAt(event.pick_lock_at)) return toast('Picks are locked', 'err');
+      if (event.resolved_outcome) return toast('Event already resolved', 'err');
+      const round = s.rounds.find((r) => r.id === event.round_id);
+      const participant = s.season_participants.find(
+        (sp) => sp.season_id === round.season_id && sp.user_id === s.current_user_id
+      );
+      if (!participant) return toast('Not a participant in this season', 'err');
+      if (participant.is_eliminated) return toast('You are eliminated', 'err');
+
+      setS((p) => {
+        const existing = p.picks.find((pk) => pk.event_id === eventId && pk.user_id === p.current_user_id);
+        if (existing) {
+          return {
+            ...p,
+            picks: p.picks.map((pk) => pk.id === existing.id ? { ...pk, choice, submitted_at: nowISO() } : pk),
+          };
+        }
+        return {
+          ...p,
+          picks: [...p.picks, {
+            id: uid(), event_id: eventId, user_id: p.current_user_id,
+            choice, submitted_at: nowISO(),
+          }],
+        };
+      });
+      toast(`Pick saved: ${choice.toUpperCase()}`);
+    },
+
+    resolveEvent: (eventId, outcome) => {
+      setS((p) => ({
+        ...p,
+        events: p.events.map((e) =>
+          e.id === eventId
+            ? { ...e, resolved_outcome: outcome, status: 'resolved',
+                resolved_by_user_id: p.current_user_id, resolved_at: nowISO() }
+            : e
+        ),
+      }));
+      toast(`Event resolved: ${outcome.toUpperCase()}`);
+    },
+
+    finalizeRound: (roundId) => {
+      // Atomic compute, then single setS
+      setS((p) => {
+        const round = p.rounds.find((r) => r.id === roundId);
+        if (!round) return p;
+        if (round.finalized_at) return p; // already done
+        const season = p.seasons.find((se) => se.id === round.season_id);
+        if (!season || season.status !== 'in_progress') return p;
+        const events = p.events.filter((e) => e.round_id === roundId);
+        if (events.length === 0) return p;
+        if (events.some((e) => !e.resolved_outcome)) return p;
+
+        const participants = p.season_participants.filter((sp) => sp.season_id === season.id);
+        const newLedger = [];
+        const updatedParticipants = participants.map((sp) => {
+          if (sp.is_eliminated) return sp;
+          let wrong = 0, correct = 0;
+          for (const e of events) {
+            const pick = p.picks.find((pk) => pk.event_id === e.id && pk.user_id === sp.user_id);
+            if (!pick) {
+              wrong += 1;
+              newLedger.push({
+                id: uid(), season_id: season.id, user_id: sp.user_id,
+                event_id: e.id, round_number: round.round_number,
+                delta: -MVP.CREDIT_LOSS, reason: 'No pick forfeiture',
+                created_at: nowISO(),
+              });
+            } else if (pick.choice !== e.resolved_outcome) {
+              wrong += 1;
+              newLedger.push({
+                id: uid(), season_id: season.id, user_id: sp.user_id,
+                event_id: e.id, round_number: round.round_number,
+                delta: -MVP.CREDIT_LOSS, reason: 'Wrong pick',
+                created_at: nowISO(),
+              });
+            } else {
+              correct += 1;
+            }
+          }
+          const deduct = wrong * MVP.CREDIT_LOSS;
+          const newCredits = Math.max(0, sp.credits_remaining - deduct);
+          const justEliminated = newCredits === 0 && !sp.is_eliminated;
+          return {
+            ...sp,
+            credits_remaining: newCredits,
+            wrong_picks_count: sp.wrong_picks_count + wrong,
+            correct_picks_count: sp.correct_picks_count + correct,
+            is_eliminated: justEliminated || sp.is_eliminated,
+            eliminated_at: justEliminated ? nowISO() : sp.eliminated_at,
+          };
+        });
+
+        const newRounds = p.rounds.map((r) =>
+          r.id === roundId
+            ? { ...r, status: 'resolved', finalized_at: nowISO(), finalized_by_user_id: p.current_user_id }
+            : r
+        );
+
+        // Check season completion: if this was the rounds_total-th round, mark season completed
+        const finalizedCount = newRounds.filter((r) => r.season_id === season.id && r.finalized_at).length;
+        const newSeasons = finalizedCount >= season.rounds_total
+          ? p.seasons.map((se) => se.id === season.id ? { ...se, status: 'completed', end_date: nowISO() } : se)
+          : p.seasons;
+
+        const newLeagues = finalizedCount >= season.rounds_total
+          ? p.leagues.map((l) => l.id === season.league_id ? { ...l, status: 'completed' } : l)
+          : p.leagues;
+
+        return {
+          ...p,
+          season_participants: p.season_participants.map((sp) => {
+            const u = updatedParticipants.find((x) => x.id === sp.id);
+            return u || sp;
+          }),
+          credit_ledger: [...p.credit_ledger, ...newLedger],
+          rounds: newRounds,
+          seasons: newSeasons,
+          leagues: newLeagues,
+        };
+      });
+      toast('Round finalized — standings updated');
+    },
+
+    openLeague: (leagueId) => setS((p) => ({ ...p, view: 'league', active_league_id: leagueId })),
+    backToDashboard: () => setS((p) => ({ ...p, view: 'dashboard', active_league_id: null })),
+  };
+
+  return (
+    <div className="min-h-screen bg-stone-50 text-stone-900" style={{ fontFamily: 'ui-sans-serif, system-ui, sans-serif' }}>
+      <Header s={s} act={act} />
+      <main className="max-w-6xl mx-auto px-4 py-6">
+        {!s.current_user_id && <NoUserPanel act={act} />}
+        {s.current_user_id && s.view === 'dashboard' && <Dashboard s={s} act={act} />}
+        {s.current_user_id && s.view === 'league' && <LeagueView s={s} act={act} />}
+      </main>
+      {s.toast && <Toast toast={s.toast} />}
+      <Footer />
+    </div>
+  );
+}
+
+// ============================================================
+// HEADER
+// ============================================================
+function Header({ s, act }) {
+  const [showAdd, setShowAdd] = useState(false);
+  const [name, setName] = useState('');
+  const currentUser = s.profiles.find((p) => p.id === s.current_user_id);
+
+  return (
+    <header className="border-b-2 border-stone-900 bg-white">
+      <div className="max-w-6xl mx-auto px-4 py-3 flex items-center justify-between gap-4">
+        <div className="flex items-center gap-3">
+          <div className="w-7 h-7 bg-stone-900 text-white flex items-center justify-center font-mono text-xs font-bold">
+            P
+          </div>
+          <div>
+            <div className="font-mono text-xs font-bold tracking-wider">PEPL.PROTO</div>
+            <div className="font-mono text-[10px] text-stone-500 -mt-0.5">private_event_prediction_league / mvp</div>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-2">
+          {s.profiles.length > 0 && (
+            <div className="flex items-center gap-1 bg-stone-100 border border-stone-300 px-2 py-1">
+              <Users size={12} className="text-stone-500" />
+              <select
+                className="bg-transparent font-mono text-xs outline-none cursor-pointer"
+                value={s.current_user_id || ''}
+                onChange={(e) => act.switchUser(e.target.value)}
+              >
+                {s.profiles.map((p) => (
+                  <option key={p.id} value={p.id}>{p.display_name}</option>
+                ))}
+              </select>
+            </div>
+          )}
+          <button
+            onClick={() => setShowAdd(!showAdd)}
+            className="flex items-center gap-1 px-2 py-1 border border-stone-900 hover:bg-stone-900 hover:text-white font-mono text-xs"
+          >
+            <Plus size={12} /> ADD USER
+          </button>
+          <button
+            onClick={act.resetAll}
+            className="flex items-center gap-1 px-2 py-1 border border-rose-700 text-rose-700 hover:bg-rose-700 hover:text-white font-mono text-xs"
+          >
+            <Trash2 size={12} /> RESET
+          </button>
+        </div>
+      </div>
+      {showAdd && (
+        <div className="border-t border-stone-200 bg-stone-50">
+          <div className="max-w-6xl mx-auto px-4 py-2 flex items-center gap-2">
+            <span className="font-mono text-[10px] uppercase text-stone-500">new_user.display_name=</span>
+            <input
+              autoFocus
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="e.g. Alex"
+              className="border border-stone-300 px-2 py-1 font-mono text-xs flex-1 max-w-xs outline-none focus:border-stone-900"
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && name.trim()) {
+                  act.addUser(name.trim()); setName(''); setShowAdd(false);
+                }
+              }}
+            />
+            <button
+              onClick={() => { if (name.trim()) { act.addUser(name.trim()); setName(''); setShowAdd(false); } }}
+              className="px-3 py-1 bg-stone-900 text-white font-mono text-xs"
+            >
+              CREATE
+            </button>
+            <button onClick={() => setShowAdd(false)} className="px-2 py-1 font-mono text-xs text-stone-500">
+              cancel
+            </button>
+          </div>
+        </div>
+      )}
+    </header>
+  );
+}
+
+// ============================================================
+// EMPTY STATE — NO USER YET
+// ============================================================
+function NoUserPanel({ act }) {
+  const [name, setName] = useState('');
+  return (
+    <div className="border border-stone-300 bg-white p-8 max-w-md mx-auto mt-12">
+      <div className="font-mono text-[10px] uppercase tracking-wider text-stone-500 mb-2">step_01 / bootstrap</div>
+      <h2 className="text-lg font-bold mb-1">Create your first user</h2>
+      <p className="text-sm text-stone-600 mb-4">
+        This prototype simulates multiple users via a switcher in the header.
+        Start by creating yourself, then add more users to demo admin + member flows.
+      </p>
+      <input
+        autoFocus
+        placeholder="Display name"
+        value={name}
+        onChange={(e) => setName(e.target.value)}
+        onKeyDown={(e) => { if (e.key === 'Enter' && name.trim()) act.addUser(name.trim()); }}
+        className="w-full border border-stone-300 px-3 py-2 font-mono text-sm mb-3 outline-none focus:border-stone-900"
+      />
+      <button
+        disabled={!name.trim()}
+        onClick={() => name.trim() && act.addUser(name.trim())}
+        className="w-full bg-stone-900 text-white py-2 font-mono text-xs uppercase tracking-wider disabled:bg-stone-300"
+      >
+        Create User
+      </button>
+    </div>
+  );
+}
+
+// ============================================================
+// DASHBOARD
+// ============================================================
+function Dashboard({ s, act }) {
+  const [showCreate, setShowCreate] = useState(false);
+  const [showJoin, setShowJoin] = useState(false);
+
+  const myMemberships = s.league_memberships.filter((m) => m.user_id === s.current_user_id);
+  const myLeagues = myMemberships.map((m) => {
+    const league = s.leagues.find((l) => l.id === m.league_id);
+    const season = s.seasons.find((se) => se.league_id === m.league_id);
+    return { league, role: m.role, season };
+  }).filter((x) => x.league);
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-6">
+        <div>
+          <div className="font-mono text-[10px] uppercase tracking-wider text-stone-500">/dashboard</div>
+          <h1 className="text-2xl font-bold mt-1">Your leagues</h1>
+        </div>
+        <div className="flex gap-2">
+          <button
+            onClick={() => { setShowCreate(true); setShowJoin(false); }}
+            className="flex items-center gap-1 px-3 py-2 bg-stone-900 text-white font-mono text-xs uppercase tracking-wider"
+          >
+            <Plus size={14} /> Create League
+          </button>
+          <button
+            onClick={() => { setShowJoin(true); setShowCreate(false); }}
+            className="flex items-center gap-1 px-3 py-2 border border-stone-900 font-mono text-xs uppercase tracking-wider"
+          >
+            <LogIn size={14} /> Join League
+          </button>
+        </div>
+      </div>
+
+      {showCreate && <CreateLeagueForm onCancel={() => setShowCreate(false)} onSubmit={(d) => { act.createLeague(d); setShowCreate(false); }} />}
+      {showJoin && <JoinLeagueForm onCancel={() => setShowJoin(false)} onSubmit={(c) => { act.joinLeague(c); setShowJoin(false); }} />}
+
+      {myLeagues.length === 0 && !showCreate && !showJoin && (
+        <div className="border border-dashed border-stone-300 bg-white p-12 text-center">
+          <div className="font-mono text-xs text-stone-500 uppercase tracking-wider mb-2">empty_state</div>
+          <p className="text-stone-600">You aren't in any leagues yet. Create one or join with an invite code.</p>
+        </div>
+      )}
+
+      {myLeagues.length > 0 && (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          {myLeagues.map(({ league, role, season }) => (
+            <button
+              key={league.id}
+              onClick={() => act.openLeague(league.id)}
+              className="text-left border border-stone-300 bg-white p-4 hover:border-stone-900 transition-colors"
+            >
+              <div className="flex items-center justify-between mb-2">
+                <div className="font-bold">{league.name}</div>
+                {role === 'admin' && (
+                  <span className="flex items-center gap-1 px-2 py-0.5 bg-amber-100 border border-amber-300 font-mono text-[10px] uppercase">
+                    <Crown size={10} /> Admin
+                  </span>
+                )}
+              </div>
+              <div className="font-mono text-[10px] text-stone-500 uppercase tracking-wider mb-1">
+                source_of_truth: <span className="text-stone-700">{league.source_of_truth}</span>
+              </div>
+              <div className="flex items-center gap-3 mt-3 font-mono text-[10px] text-stone-600">
+                <SeasonStatusBadge status={season?.status} />
+                <span>members: {s.league_memberships.filter((m) => m.league_id === league.id).length}</span>
+                <span>rounds: {s.rounds.filter((r) => r.season_id === season?.id).length}</span>
+              </div>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CreateLeagueForm({ onSubmit, onCancel }) {
+  const [name, setName] = useState('');
+  const [sot, setSot] = useState('');
+  const [desc, setDesc] = useState('');
+  return (
+    <div className="border border-stone-900 bg-white p-4 mb-6">
+      <div className="font-mono text-[10px] uppercase tracking-wider text-stone-500 mb-3">/create_league</div>
+      <div className="grid gap-3">
+        <Field label="league.name" value={name} onChange={setName} placeholder="e.g. Sunday Football Crew" />
+        <Field label="league.source_of_truth" value={sot} onChange={setSot} placeholder="e.g. ESPN game results / official AMPAS announcement" hint="Used to settle disputes. Be specific." />
+        <Field label="league.description (optional)" value={desc} onChange={setDesc} placeholder="" />
+      </div>
+      <div className="flex gap-2 mt-4">
+        <button
+          disabled={!name.trim() || !sot.trim()}
+          onClick={() => onSubmit({ name: name.trim(), source_of_truth: sot.trim(), description: desc.trim() })}
+          className="px-3 py-2 bg-stone-900 text-white font-mono text-xs uppercase disabled:bg-stone-300"
+        >
+          Create
+        </button>
+        <button onClick={onCancel} className="px-3 py-2 font-mono text-xs text-stone-500">cancel</button>
+      </div>
+    </div>
+  );
+}
+
+function JoinLeagueForm({ onSubmit, onCancel }) {
+  const [code, setCode] = useState('');
+  return (
+    <div className="border border-stone-900 bg-white p-4 mb-6">
+      <div className="font-mono text-[10px] uppercase tracking-wider text-stone-500 mb-3">/join_league</div>
+      <Field label="invite_code" value={code} onChange={setCode} placeholder="e.g. AB12CD" />
+      <div className="flex gap-2 mt-4">
+        <button
+          disabled={!code.trim()}
+          onClick={() => onSubmit(code.trim())}
+          className="px-3 py-2 bg-stone-900 text-white font-mono text-xs uppercase disabled:bg-stone-300"
+        >
+          Join
+        </button>
+        <button onClick={onCancel} className="px-3 py-2 font-mono text-xs text-stone-500">cancel</button>
+      </div>
+    </div>
+  );
+}
+
+function Field({ label, value, onChange, placeholder, hint }) {
+  return (
+    <div>
+      <label className="font-mono text-[10px] uppercase tracking-wider text-stone-500 block mb-1">{label}</label>
+      <input
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={placeholder}
+        className="w-full border border-stone-300 px-2 py-1.5 font-mono text-xs outline-none focus:border-stone-900"
+      />
+      {hint && <div className="text-[10px] text-stone-500 mt-1">{hint}</div>}
+    </div>
+  );
+}
+
+// ============================================================
+// LEAGUE VIEW
+// ============================================================
+function LeagueView({ s, act }) {
+  const league = s.leagues.find((l) => l.id === s.active_league_id);
+  if (!league) return <div className="p-8">League not found</div>;
+
+  const isAdmin = league.admin_user_id === s.current_user_id;
+  const myMembership = s.league_memberships.find(
+    (m) => m.league_id === league.id && m.user_id === s.current_user_id
+  );
+  if (!myMembership) {
+    return (
+      <div className="border border-rose-300 bg-rose-50 p-6 text-center">
+        <AlertCircle className="mx-auto mb-2 text-rose-600" />
+        <div className="font-bold mb-1">Not a member</div>
+        <p className="text-sm text-stone-600 mb-3">You don't belong to this league.</p>
+        <button onClick={act.backToDashboard} className="px-3 py-1 border border-stone-900 font-mono text-xs uppercase">
+          ← back
+        </button>
+      </div>
+    );
+  }
+
+  const seasons = s.seasons.filter((se) => se.league_id === league.id);
+  const season = seasons[0]; // MVP: one season per league
+  const rounds = s.rounds.filter((r) => r.season_id === season?.id).sort((a, b) => a.round_number - b.round_number);
+  const members = s.league_memberships.filter((m) => m.league_id === league.id).map((m) => ({
+    ...m,
+    profile: s.profiles.find((p) => p.id === m.user_id),
+  }));
+
+  return (
+    <div>
+      {/* Top bar */}
+      <button onClick={act.backToDashboard} className="flex items-center gap-1 font-mono text-xs text-stone-500 hover:text-stone-900 mb-3">
+        <ChevronLeft size={14} /> dashboard
+      </button>
+
+      {/* League header */}
+      <div className="border border-stone-900 bg-white p-4 mb-4">
+        <div className="flex items-start justify-between gap-4 mb-3">
+          <div className="flex-1">
+            <div className="flex items-center gap-2 mb-1">
+              <h1 className="text-xl font-bold">{league.name}</h1>
+              {isAdmin && (
+                <span className="flex items-center gap-1 px-2 py-0.5 bg-amber-100 border border-amber-300 font-mono text-[10px] uppercase">
+                  <Crown size={10} /> You're Admin
+                </span>
+              )}
+            </div>
+            {league.description && <p className="text-sm text-stone-600">{league.description}</p>}
+            <div className="font-mono text-[10px] text-stone-500 uppercase mt-1">
+              source_of_truth: <span className="text-stone-700">{league.source_of_truth}</span>
+            </div>
+          </div>
+          <InviteCodeBox code={inviteCodeOf(league.id)} />
+        </div>
+        <div className="flex items-center gap-3 pt-3 border-t border-stone-200 font-mono text-[10px]">
+          <SeasonStatusBadge status={season?.status} />
+          <span className="text-stone-500">season: {season?.season_number}</span>
+          <span className="text-stone-500">rounds: {rounds.length} / {season?.rounds_total}</span>
+          <span className="text-stone-500">members: {members.length}</span>
+        </div>
+      </div>
+
+      {/* Admin: Start Season */}
+      {isAdmin && season?.status === 'not_started' && (
+        <div className="border border-emerald-600 bg-emerald-50 p-4 mb-4 flex items-center justify-between">
+          <div>
+            <div className="font-bold text-sm">Season hasn't started yet</div>
+            <div className="text-xs text-stone-600">Once started, members will be locked in with {MVP.STARTING_CREDITS} credits each.</div>
+          </div>
+          <button
+            onClick={() => act.startSeason(season.id)}
+            className="flex items-center gap-1 px-3 py-2 bg-emerald-600 text-white font-mono text-xs uppercase"
+          >
+            <Play size={12} /> Start Season
+          </button>
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        {/* Left: rounds */}
+        <div className="lg:col-span-2 space-y-4">
+          <RoundsPanel s={s} act={act} season={season} rounds={rounds} isAdmin={isAdmin} />
+        </div>
+
+        {/* Right: leaderboard + members */}
+        <div className="space-y-4">
+          <Leaderboard s={s} season={season} />
+          <MembersPanel members={members} adminId={league.admin_user_id} />
+          <CreditLedgerPanel s={s} season={season} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function InviteCodeBox({ code }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <button
+      onClick={() => { navigator.clipboard?.writeText(code); setCopied(true); setTimeout(() => setCopied(false), 1500); }}
+      className="border border-stone-300 bg-stone-50 px-3 py-2 hover:border-stone-900 group"
+      title="Copy invite code"
+    >
+      <div className="font-mono text-[10px] text-stone-500 uppercase tracking-wider">invite_code</div>
+      <div className="flex items-center gap-2">
+        <span className="font-mono text-base font-bold tracking-widest">{code}</span>
+        <Copy size={12} className="text-stone-400 group-hover:text-stone-900" />
+      </div>
+      {copied && <div className="text-[10px] text-emerald-700 mt-0.5">copied</div>}
+    </button>
+  );
+}
+
+// ============================================================
+// ROUNDS PANEL
+// ============================================================
+function RoundsPanel({ s, act, season, rounds, isAdmin }) {
+  const [showCreate, setShowCreate] = useState(false);
+
+  if (!season) return null;
+
+  const canCreateRound = isAdmin && season.status === 'in_progress' && rounds.length < season.rounds_total;
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-2">
+        <div className="font-mono text-[10px] uppercase tracking-wider text-stone-500">/rounds</div>
+        {canCreateRound && (
+          <button
+            onClick={() => setShowCreate(!showCreate)}
+            className="flex items-center gap-1 px-2 py-1 bg-stone-900 text-white font-mono text-[10px] uppercase"
+          >
+            <Plus size={10} /> New Round
+          </button>
+        )}
+      </div>
+
+      {showCreate && (
+        <CreateRoundForm
+          nextNum={rounds.length + 1}
+          onSubmit={(d) => { act.createRound(season.id, d); setShowCreate(false); }}
+          onCancel={() => setShowCreate(false)}
+        />
+      )}
+
+      {rounds.length === 0 && (
+        <div className="border border-dashed border-stone-300 bg-white p-6 text-center">
+          <div className="font-mono text-xs text-stone-500 uppercase mb-1">no_rounds_yet</div>
+          {!isAdmin && <p className="text-xs text-stone-600">Waiting for the admin to create a round.</p>}
+          {isAdmin && season.status === 'not_started' && <p className="text-xs text-stone-600">Start the season first.</p>}
+        </div>
+      )}
+
+      <div className="space-y-3">
+        {rounds.map((r) => (
+          <RoundCard key={r.id} s={s} act={act} round={r} season={season} isAdmin={isAdmin} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function CreateRoundForm({ nextNum, onSubmit, onCancel }) {
+  const [title, setTitle] = useState('');
+  return (
+    <div className="border border-stone-900 bg-white p-3 mb-3">
+      <div className="font-mono text-[10px] uppercase tracking-wider text-stone-500 mb-2">new_round / round_{nextNum}</div>
+      <Field label="round.title" value={title} onChange={setTitle} placeholder="e.g. NFL Week 1, Oscars Main Awards" />
+      <div className="flex gap-2 mt-3">
+        <button
+          disabled={!title.trim()}
+          onClick={() => onSubmit({ title: title.trim(), round_lock_at: null })}
+          className="px-3 py-1.5 bg-stone-900 text-white font-mono text-[10px] uppercase disabled:bg-stone-300"
+        >
+          Create Round
+        </button>
+        <button onClick={onCancel} className="px-3 py-1.5 font-mono text-[10px] text-stone-500">cancel</button>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// ROUND CARD
+// ============================================================
+function RoundCard({ s, act, round, season, isAdmin }) {
+  const [showCreateEvent, setShowCreateEvent] = useState(false);
+  const [confirmFinalize, setConfirmFinalize] = useState(false);
+  const events = s.events.filter((e) => e.round_id === round.id);
+  const allResolved = events.length > 0 && events.every((e) => e.resolved_outcome);
+  const isFinalized = !!round.finalized_at;
+
+  return (
+    <div className={`border bg-white ${isFinalized ? 'border-stone-300 opacity-90' : 'border-stone-900'}`}>
+      <div className="flex items-center justify-between px-3 py-2 border-b border-stone-200 bg-stone-50">
+        <div className="flex items-center gap-2">
+          <Hash size={12} className="text-stone-400" />
+          <span className="font-mono text-xs font-bold">round_{round.round_number}</span>
+          <span className="text-sm">{round.title}</span>
+          <RoundStatusBadge round={round} />
+        </div>
+        <div className="flex items-center gap-2">
+          {isAdmin && !isFinalized && (
+            <button
+              onClick={() => setShowCreateEvent(!showCreateEvent)}
+              className="flex items-center gap-1 px-2 py-1 border border-stone-900 font-mono text-[10px] uppercase"
+            >
+              <Plus size={10} /> Event
+            </button>
+          )}
+          {isAdmin && !isFinalized && events.length > 0 && (
+            <button
+              disabled={!allResolved}
+              onClick={() => setConfirmFinalize(true)}
+              className={`flex items-center gap-1 px-2 py-1 font-mono text-[10px] uppercase ${
+                allResolved ? 'bg-emerald-600 text-white' : 'bg-stone-200 text-stone-400 cursor-not-allowed'
+              }`}
+              title={allResolved ? 'Finalize round and apply credit deductions' : 'Resolve all events first'}
+            >
+              <Flag size={10} /> Finalize
+            </button>
+          )}
+        </div>
+      </div>
+
+      {confirmFinalize && (
+        <div className="border-b border-amber-300 bg-amber-50 px-3 py-3">
+          <div className="flex items-center gap-2 text-sm font-bold mb-1">
+            <AlertTriangle size={14} /> Finalize round?
+          </div>
+          <div className="text-xs text-stone-700 mb-3">
+            This applies credit deductions for all wrong/missed picks and cannot be undone.
+          </div>
+          <div className="flex gap-2">
+            <button
+              onClick={() => { act.finalizeRound(round.id); setConfirmFinalize(false); }}
+              className="px-3 py-1 bg-amber-600 text-white font-mono text-[10px] uppercase"
+            >
+              Confirm Finalize
+            </button>
+            <button onClick={() => setConfirmFinalize(false)} className="px-3 py-1 font-mono text-[10px] text-stone-600">cancel</button>
+          </div>
+        </div>
+      )}
+
+      {showCreateEvent && isAdmin && !isFinalized && (
+        <div className="border-b border-stone-200 px-3 py-3 bg-stone-50">
+          <CreateEventForm
+            onSubmit={(d) => { act.createEvent(round.id, d); setShowCreateEvent(false); }}
+            onCancel={() => setShowCreateEvent(false)}
+          />
+        </div>
+      )}
+
+      <div className="divide-y divide-stone-100">
+        {events.length === 0 && (
+          <div className="px-3 py-4 font-mono text-[10px] text-stone-400 uppercase">no events in this round</div>
+        )}
+        {events.map((e) => (
+          <EventRow key={e.id} s={s} act={act} event={e} round={round} season={season} isAdmin={isAdmin} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function CreateEventForm({ onSubmit, onCancel }) {
+  const [title, setTitle] = useState('');
+  const [prompt, setPrompt] = useState('');
+  const [lockMinutes, setLockMinutes] = useState('60');
+  return (
+    <div>
+      <div className="font-mono text-[10px] uppercase tracking-wider text-stone-500 mb-2">new_event</div>
+      <div className="grid gap-2">
+        <Field label="event.title" value={title} onChange={setTitle} placeholder="e.g. Chiefs vs Bills" />
+        <Field
+          label="event.prompt"
+          value={prompt}
+          onChange={setPrompt}
+          placeholder="e.g. Will the Chiefs win?"
+          hint="Must be unambiguous Yes/No."
+        />
+        <div>
+          <label className="font-mono text-[10px] uppercase tracking-wider text-stone-500 block mb-1">
+            event.pick_lock_at = now + N minutes
+          </label>
+          <div className="flex items-center gap-2">
+            <input
+              type="number"
+              value={lockMinutes}
+              min="1"
+              onChange={(e) => setLockMinutes(e.target.value)}
+              className="border border-stone-300 px-2 py-1 font-mono text-xs w-24 outline-none focus:border-stone-900"
+            />
+            <span className="font-mono text-[10px] text-stone-500">minutes</span>
+            <span className="font-mono text-[10px] text-stone-400">→ {fmtTime(inFuture(parseInt(lockMinutes) || 60))}</span>
+          </div>
+          <div className="text-[10px] text-stone-500 mt-1">For demo speed, you can also "Lock Now" from the event row.</div>
+        </div>
+      </div>
+      <div className="flex gap-2 mt-3">
+        <button
+          disabled={!title.trim() || !prompt.trim()}
+          onClick={() => onSubmit({
+            title: title.trim(), prompt: prompt.trim(),
+            pick_lock_at: inFuture(parseInt(lockMinutes) || 60),
+          })}
+          className="px-3 py-1.5 bg-stone-900 text-white font-mono text-[10px] uppercase disabled:bg-stone-300"
+        >
+          Create Event
+        </button>
+        <button onClick={onCancel} className="px-3 py-1.5 font-mono text-[10px] text-stone-500">cancel</button>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// EVENT ROW
+// ============================================================
+function EventRow({ s, act, event, round, season, isAdmin }) {
+  const locked = isLockedAt(event.pick_lock_at);
+  const resolved = !!event.resolved_outcome;
+  const myPick = s.picks.find((p) => p.event_id === event.id && p.user_id === s.current_user_id);
+  const myParticipant = s.season_participants.find(
+    (sp) => sp.season_id === season.id && sp.user_id === s.current_user_id
+  );
+  const isEliminated = myParticipant?.is_eliminated;
+  const canPick = !locked && !resolved && !isEliminated && season.status === 'in_progress' && myParticipant;
+
+  return (
+    <div className="px-3 py-3">
+      <div className="flex items-start justify-between gap-3">
+        <div className="flex-1">
+          <div className="flex items-center gap-2 mb-1">
+            <span className="font-mono text-[10px] uppercase text-stone-500">event</span>
+            <span className="font-bold text-sm">{event.title}</span>
+            <EventStatusBadge event={event} locked={locked} />
+          </div>
+          <div className="text-sm mb-2">
+            <span className="text-stone-500">prompt:</span> {event.prompt}
+          </div>
+          <div className="flex items-center gap-3 font-mono text-[10px] text-stone-500">
+            <Clock size={10} /> lock: {fmtTime(event.pick_lock_at)}
+            {resolved && (
+              <span className={event.resolved_outcome === 'yes' ? 'text-emerald-700' : 'text-rose-700'}>
+                resolved: {event.resolved_outcome.toUpperCase()}
+              </span>
+            )}
+          </div>
+        </div>
+
+        {/* Right side: pick UI + admin controls */}
+        <div className="flex flex-col items-end gap-2 min-w-[200px]">
+          {/* Member pick UI */}
+          {!resolved && (
+            <div className="flex items-center gap-1">
+              <button
+                disabled={!canPick}
+                onClick={() => act.submitPick(event.id, 'yes')}
+                className={`px-3 py-1.5 font-mono text-xs uppercase border ${
+                  myPick?.choice === 'yes'
+                    ? 'bg-emerald-600 text-white border-emerald-600'
+                    : canPick
+                    ? 'border-stone-900 hover:bg-stone-900 hover:text-white'
+                    : 'border-stone-200 text-stone-300 cursor-not-allowed'
+                }`}
+              >
+                Yes
+              </button>
+              <button
+                disabled={!canPick}
+                onClick={() => act.submitPick(event.id, 'no')}
+                className={`px-3 py-1.5 font-mono text-xs uppercase border ${
+                  myPick?.choice === 'no'
+                    ? 'bg-rose-600 text-white border-rose-600'
+                    : canPick
+                    ? 'border-stone-900 hover:bg-stone-900 hover:text-white'
+                    : 'border-stone-200 text-stone-300 cursor-not-allowed'
+                }`}
+              >
+                No
+              </button>
+            </div>
+          )}
+
+          {!resolved && !canPick && !myPick && (
+            <div className="font-mono text-[10px] text-stone-500">
+              {isEliminated ? 'eliminated — cannot pick' :
+               locked ? 'picks locked' :
+               season.status !== 'in_progress' ? 'season not started' :
+               !myParticipant ? 'not a participant' : ''}
+            </div>
+          )}
+
+          {myPick && !resolved && (
+            <div className="font-mono text-[10px] text-stone-500">
+              your pick: <span className="font-bold text-stone-900">{myPick.choice.toUpperCase()}</span>
+              {!locked && <span> · editable until lock</span>}
+            </div>
+          )}
+
+          {/* Result indicator after resolved */}
+          {resolved && myPick && (
+            <div className="flex items-center gap-1 font-mono text-[10px]">
+              you: <span className="font-bold">{myPick.choice.toUpperCase()}</span>
+              {myPick.choice === event.resolved_outcome ? (
+                <CheckCircle2 size={12} className="text-emerald-600" />
+              ) : (
+                <XCircle size={12} className="text-rose-600" />
+              )}
+            </div>
+          )}
+          {resolved && !myPick && myParticipant && (
+            <div className="flex items-center gap-1 font-mono text-[10px] text-rose-700">
+              you didn't pick <Skull size={12} />
+            </div>
+          )}
+
+          {/* Admin: lock + resolve */}
+          {isAdmin && (
+            <div className="flex items-center gap-1">
+              {!locked && !resolved && (
+                <button
+                  onClick={() => act.forceLockEvent(event.id)}
+                  className="flex items-center gap-1 px-2 py-1 border border-stone-300 font-mono text-[10px] uppercase hover:border-stone-900"
+                  title="Force lock now (demo helper)"
+                >
+                  <Lock size={10} /> Lock Now
+                </button>
+              )}
+              {!resolved && !round.finalized_at && (
+                <>
+                  <button
+                    onClick={() => act.resolveEvent(event.id, 'yes')}
+                    className="px-2 py-1 border border-emerald-600 text-emerald-700 hover:bg-emerald-600 hover:text-white font-mono text-[10px] uppercase"
+                  >
+                    Resolve: Yes
+                  </button>
+                  <button
+                    onClick={() => act.resolveEvent(event.id, 'no')}
+                    className="px-2 py-1 border border-rose-600 text-rose-700 hover:bg-rose-600 hover:text-white font-mono text-[10px] uppercase"
+                  >
+                    Resolve: No
+                  </button>
+                </>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Show all members' picks once resolved (transparency) */}
+      {resolved && (
+        <div className="mt-2 pt-2 border-t border-stone-100">
+          <div className="font-mono text-[10px] uppercase text-stone-500 mb-1">all_picks</div>
+          <div className="flex flex-wrap gap-1">
+            {s.season_participants
+              .filter((sp) => sp.season_id === season.id)
+              .map((sp) => {
+                const profile = s.profiles.find((p) => p.id === sp.user_id);
+                const pick = s.picks.find((pk) => pk.event_id === event.id && pk.user_id === sp.user_id);
+                const correct = pick && pick.choice === event.resolved_outcome;
+                return (
+                  <span
+                    key={sp.id}
+                    className={`px-2 py-0.5 border font-mono text-[10px] ${
+                      !pick ? 'bg-stone-100 border-stone-300 text-stone-500' :
+                      correct ? 'bg-emerald-50 border-emerald-300 text-emerald-800' :
+                      'bg-rose-50 border-rose-300 text-rose-800'
+                    }`}
+                  >
+                    {profile?.display_name || '?'}: {pick?.choice?.toUpperCase() || 'NO PICK'}
+                  </span>
+                );
+              })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ============================================================
+// LEADERBOARD
+// ============================================================
+function Leaderboard({ s, season }) {
+  const ranked = useMemo(() => {
+    if (!season) return [];
+    const participants = s.season_participants.filter((sp) => sp.season_id === season.id);
+    return participants
+      .map((sp) => {
+        const profile = s.profiles.find((p) => p.id === sp.user_id);
+        const total = sp.correct_picks_count + sp.wrong_picks_count;
+        const accuracy = total > 0 ? sp.correct_picks_count / total : 0;
+        return { ...sp, profile, accuracy };
+      })
+      .sort((a, b) => {
+        if (b.credits_remaining !== a.credits_remaining) return b.credits_remaining - a.credits_remaining;
+        if (b.accuracy !== a.accuracy) return b.accuracy - a.accuracy;
+        return (a.profile?.display_name || '').localeCompare(b.profile?.display_name || '');
+      });
+  }, [s.season_participants, s.profiles, season]);
+
+  if (!season) return null;
+
+  const topCredits = ranked[0]?.credits_remaining;
+  const seasonComplete = season.status === 'completed';
+
+  return (
+    <div className="border border-stone-900 bg-white">
+      <div className="flex items-center gap-2 px-3 py-2 border-b border-stone-200 bg-stone-50">
+        <Trophy size={12} />
+        <span className="font-mono text-xs font-bold uppercase tracking-wider">Leaderboard</span>
+      </div>
+      <div className="p-2">
+        {ranked.length === 0 && <div className="px-2 py-3 font-mono text-[10px] text-stone-400">no participants yet</div>}
+        <table className="w-full text-xs">
+          <thead>
+            <tr className="font-mono text-[10px] text-stone-500 uppercase">
+              <th className="text-left py-1 pl-1">#</th>
+              <th className="text-left">Player</th>
+              <th className="text-right">Credits</th>
+              <th className="text-right">✓</th>
+              <th className="text-right">✗</th>
+              <th className="text-right pr-1">Acc</th>
+            </tr>
+          </thead>
+          <tbody>
+            {ranked.map((r, i) => {
+              const isWinner = seasonComplete && r.credits_remaining === topCredits && i === 0;
+              return (
+                <tr
+                  key={r.id}
+                  className={`border-t border-stone-100 ${r.is_eliminated ? 'opacity-50' : ''}`}
+                >
+                  <td className="py-1.5 pl-1 font-mono text-stone-500">{i + 1}</td>
+                  <td className="py-1.5">
+                    <div className="flex items-center gap-1">
+                      {isWinner && <Trophy size={10} className="text-amber-600" />}
+                      <span className="font-medium">{r.profile?.display_name}</span>
+                      {r.is_eliminated && <Skull size={10} className="text-stone-400" />}
+                    </div>
+                  </td>
+                  <td className="text-right py-1.5 font-mono tabular-nums font-bold">{r.credits_remaining}</td>
+                  <td className="text-right py-1.5 font-mono tabular-nums text-emerald-700">{r.correct_picks_count}</td>
+                  <td className="text-right py-1.5 font-mono tabular-nums text-rose-700">{r.wrong_picks_count}</td>
+                  <td className="text-right py-1.5 pr-1 font-mono tabular-nums text-stone-600">
+                    {(r.accuracy * 100).toFixed(0)}%
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      {seasonComplete && ranked[0] && (
+        <div className="border-t border-amber-300 bg-amber-50 px-3 py-2 font-mono text-[10px] uppercase tracking-wider flex items-center gap-1">
+          <Trophy size={12} className="text-amber-600" /> Winner: {ranked[0].profile?.display_name}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ============================================================
+// MEMBERS PANEL
+// ============================================================
+function MembersPanel({ members, adminId }) {
+  return (
+    <div className="border border-stone-300 bg-white">
+      <div className="flex items-center gap-2 px-3 py-2 border-b border-stone-200 bg-stone-50">
+        <Users size={12} />
+        <span className="font-mono text-xs font-bold uppercase tracking-wider">Members ({members.length})</span>
+      </div>
+      <div className="divide-y divide-stone-100">
+        {members.map((m) => (
+          <div key={m.id} className="px-3 py-1.5 flex items-center justify-between text-xs">
+            <span>{m.profile?.display_name}</span>
+            {m.user_id === adminId && (
+              <span className="flex items-center gap-1 font-mono text-[10px] text-amber-700">
+                <Crown size={10} /> admin
+              </span>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// CREDIT LEDGER PANEL
+// ============================================================
+function CreditLedgerPanel({ s, season }) {
+  if (!season) return null;
+  const ledger = s.credit_ledger
+    .filter((l) => l.season_id === season.id)
+    .sort((a, b) => b.created_at.localeCompare(a.created_at))
+    .slice(0, 10);
+  return (
+    <div className="border border-stone-300 bg-white">
+      <div className="flex items-center gap-2 px-3 py-2 border-b border-stone-200 bg-stone-50">
+        <FileText size={12} />
+        <span className="font-mono text-xs font-bold uppercase tracking-wider">Credit Ledger</span>
+        <span className="font-mono text-[10px] text-stone-500 ml-auto">{ledger.length === 10 ? 'last 10' : ledger.length}</span>
+      </div>
+      <div className="divide-y divide-stone-100 max-h-64 overflow-auto">
+        {ledger.length === 0 && (
+          <div className="px-3 py-3 font-mono text-[10px] text-stone-400">no deductions yet</div>
+        )}
+        {ledger.map((l) => {
+          const profile = s.profiles.find((p) => p.id === l.user_id);
+          return (
+            <div key={l.id} className="px-3 py-1.5 font-mono text-[10px] flex items-center justify-between gap-2">
+              <span className="truncate">
+                <span className="text-stone-700 font-medium">{profile?.display_name}</span>
+                <span className="text-stone-400"> · r{l.round_number}</span>
+                <span className="text-stone-500"> · {l.reason}</span>
+              </span>
+              <span className="text-rose-700 font-bold tabular-nums">{l.delta}</span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// BADGES + HELPERS
+// ============================================================
+function SeasonStatusBadge({ status }) {
+  const map = {
+    not_started: { c: 'bg-stone-100 border-stone-300 text-stone-700', l: 'not_started' },
+    in_progress: { c: 'bg-emerald-50 border-emerald-300 text-emerald-800', l: 'in_progress' },
+    completed: { c: 'bg-amber-50 border-amber-300 text-amber-800', l: 'completed' },
+  };
+  const cfg = map[status] || map.not_started;
+  return <span className={`px-1.5 py-0.5 border font-mono text-[10px] uppercase tracking-wider ${cfg.c}`}>{cfg.l}</span>;
+}
+
+function RoundStatusBadge({ round }) {
+  if (round.finalized_at) {
+    return <span className="px-1.5 py-0.5 border bg-stone-100 border-stone-300 text-stone-700 font-mono text-[10px] uppercase">finalized</span>;
+  }
+  return <span className="px-1.5 py-0.5 border bg-emerald-50 border-emerald-300 text-emerald-800 font-mono text-[10px] uppercase">{round.status}</span>;
+}
+
+function EventStatusBadge({ event, locked }) {
+  if (event.resolved_outcome) {
+    const yes = event.resolved_outcome === 'yes';
+    return (
+      <span className={`px-1.5 py-0.5 border font-mono text-[10px] uppercase ${
+        yes ? 'bg-emerald-50 border-emerald-300 text-emerald-800' : 'bg-rose-50 border-rose-300 text-rose-800'
+      }`}>
+        resolved: {event.resolved_outcome}
+      </span>
+    );
+  }
+  if (locked) {
+    return <span className="px-1.5 py-0.5 border bg-stone-100 border-stone-300 text-stone-700 font-mono text-[10px] uppercase flex items-center gap-1"><Lock size={9} /> locked</span>;
+  }
+  return <span className="px-1.5 py-0.5 border bg-emerald-50 border-emerald-300 text-emerald-800 font-mono text-[10px] uppercase flex items-center gap-1"><Unlock size={9} /> open</span>;
+}
+
+function Toast({ toast }) {
+  const colors = {
+    info: 'bg-stone-900 text-white',
+    err: 'bg-rose-600 text-white',
+    warn: 'bg-amber-600 text-white',
+  };
+  return (
+    <div className="fixed bottom-4 right-4 z-50 animate-pulse">
+      <div className={`px-3 py-2 font-mono text-xs ${colors[toast.kind] || colors.info}`}>
+        {toast.msg}
+      </div>
+    </div>
+  );
+}
+
+function Footer() {
+  return (
+    <footer className="max-w-6xl mx-auto px-4 py-6 mt-8 border-t border-stone-200">
+      <div className="font-mono text-[10px] text-stone-400 uppercase tracking-wider">
+        pepl.proto / mvp_phase_1 / starting_credits={MVP.STARTING_CREDITS} · loss_per_wrong={MVP.CREDIT_LOSS} · rounds_per_season={MVP.ROUNDS_PER_SEASON}
+      </div>
+      <div className="font-mono text-[10px] text-stone-400 mt-1">
+        state persists across refreshes via window.storage. use RESET in header to wipe.
+      </div>
+    </footer>
+  );
+}
