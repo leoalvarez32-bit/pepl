@@ -14,9 +14,13 @@ State persists in your browser via `localStorage`. Use the `RESET` button in the
 |---|---|
 | `index.html` | The standalone prototype (single file, ~63 KB, no build step) |
 | `PEPL.jsx` | React source for the prototype, for reference |
-| `RELEASE_NOTES.md` | End-user docs: setup, walkthroughs, game rules |
+| `RELEASE_NOTES_v0.2.0.md` | End-user docs: setup, walkthroughs, game rules |
 | `app/` | Production scaffold — Next.js 14 + Supabase. Deploys to Vercel separately. |
 | `app/supabase/migrations/` | The 4 SQL migrations (schema, RLS, scoring function, app helpers) |
+## 📚 Release history
+
+   - [v0.2.0](./RELEASE_NOTES_v0.2.0.md) — Bug fixes from initial QA *(latest)*
+   - [v0.1.0](./RELEASE_NOTES_v0.1.0.md) — Initial MVP release
 
 ## 🚀 Quick demo flow
 
@@ -28,7 +32,7 @@ State persists in your browser via `localStorage`. Use the `RESET` button in the
 6. Switch back to Alex → Lock Now → Resolve → Finalize
 7. Watch the leaderboard update
 
-Full walkthrough in [`RELEASE_NOTES.md`](./RELEASE_NOTES.md).
+Full walkthrough in [`RELEASE_NOTES_v0.2.0.md`](./RELEASE_NOTES_v0.2.0.md).
 
 ## 🛠️ Production deployment
 
