@@ -134,7 +134,8 @@ export default function App() {
         season_participants: [...p.season_participants, {
           id: participantId, season_id: seasonId, user_id: p.current_user_id,
           credits_remaining: MVP.STARTING_CREDITS, wrong_picks_count: 0,
-          correct_picks_count: 0, is_eliminated: false, eliminated_at: null,
+          correct_picks_count: 0, forfeit_picks_count: 0,
+          is_eliminated: false, eliminated_at: null,
           created_at: nowISO(),
         }],
         view: 'league',
@@ -165,7 +166,8 @@ export default function App() {
         season_participants: targetSeason ? [...p.season_participants, {
           id: uid(), season_id: targetSeason.id, user_id: p.current_user_id,
           credits_remaining: MVP.STARTING_CREDITS, wrong_picks_count: 0,
-          correct_picks_count: 0, is_eliminated: false, eliminated_at: null,
+          correct_picks_count: 0, forfeit_picks_count: 0,
+          is_eliminated: false, eliminated_at: null,
           created_at: nowISO(),
         }] : p.season_participants,
         view: 'league',
@@ -286,11 +288,13 @@ export default function App() {
         const newLedger = [];
         const updatedParticipants = participants.map((sp) => {
           if (sp.is_eliminated) return sp;
-          let wrong = 0, correct = 0;
+          // FIX (Bug #3, v0.2.0): track forfeits separately from wrong picks.
+          // Both still cost credits, but accuracy excludes forfeits.
+          let wrong = 0, correct = 0, forfeit = 0;
           for (const e of events) {
             const pick = p.picks.find((pk) => pk.event_id === e.id && pk.user_id === sp.user_id);
             if (!pick) {
-              wrong += 1;
+              forfeit += 1;
               newLedger.push({
                 id: uid(), season_id: season.id, user_id: sp.user_id,
                 event_id: e.id, round_number: round.round_number,
@@ -309,13 +313,14 @@ export default function App() {
               correct += 1;
             }
           }
-          const deduct = wrong * MVP.CREDIT_LOSS;
-          const newCredits = Math.max(0, sp.credits_remaining - deduct);
+          const totalLoss = (wrong + forfeit) * MVP.CREDIT_LOSS;
+          const newCredits = Math.max(0, sp.credits_remaining - totalLoss);
           const justEliminated = newCredits === 0 && !sp.is_eliminated;
           return {
             ...sp,
             credits_remaining: newCredits,
             wrong_picks_count: sp.wrong_picks_count + wrong,
+            forfeit_picks_count: (sp.forfeit_picks_count || 0) + forfeit,
             correct_picks_count: sp.correct_picks_count + correct,
             is_eliminated: justEliminated || sp.is_eliminated,
             eliminated_at: justEliminated ? nowISO() : sp.eliminated_at,
@@ -637,13 +642,29 @@ function LeagueView({ s, act }) {
     (m) => m.league_id === league.id && m.user_id === s.current_user_id
   );
   if (!myMembership) {
+    // FIX (Bug #1, v0.2.0): one-click join instead of dead-end.
+    // We already know which league they're trying to enter — no need to make
+    // them back out, copy the invite code, and re-enter it.
+    const currentUser = s.profiles.find((p) => p.id === s.current_user_id);
     return (
-      <div className="border border-rose-300 bg-rose-50 p-6 text-center">
+      <div className="border border-rose-300 bg-rose-50 p-6 max-w-md mx-auto text-center">
         <AlertCircle className="mx-auto mb-2 text-rose-600" />
-        <div className="font-bold mb-1">Not a member</div>
-        <p className="text-sm text-stone-600 mb-3">You don't belong to this league.</p>
-        <button onClick={act.backToDashboard} className="px-3 py-1 border border-stone-900 font-mono text-xs uppercase">
-          ← back
+        <div className="font-bold mb-1">Not a member of {league.name}</div>
+        <p className="text-sm text-stone-600 mb-4">
+          {currentUser?.display_name || 'You'} isn't part of this league yet.
+          Join now to start making predictions.
+        </p>
+        <button
+          onClick={() => act.joinLeague(inviteCodeOf(league.id))}
+          className="w-full px-3 py-2 bg-stone-900 text-white font-mono text-xs uppercase tracking-wider mb-2"
+        >
+          Join {league.name}
+        </button>
+        <button
+          onClick={act.backToDashboard}
+          className="w-full px-3 py-1 font-mono text-[10px] text-stone-500 hover:text-stone-900"
+        >
+          ← back to dashboard
         </button>
       </div>
     );
@@ -958,6 +979,10 @@ function EventRow({ s, act, event, round, season, isAdmin }) {
   );
   const isEliminated = myParticipant?.is_eliminated;
   const canPick = !locked && !resolved && !isEliminated && season.status === 'in_progress' && myParticipant;
+  // FIX (Bug #2, v0.2.0): admin must pass through a confirmation dialog
+  // showing their own pick and the league's source_of_truth before resolving.
+  const [confirmResolve, setConfirmResolve] = useState(null); // null | 'yes' | 'no'
+  const league = s.leagues.find((l) => l.id === season.league_id);
 
   return (
     <div className="px-3 py-3">
@@ -1063,13 +1088,13 @@ function EventRow({ s, act, event, round, season, isAdmin }) {
               {!resolved && !round.finalized_at && (
                 <>
                   <button
-                    onClick={() => act.resolveEvent(event.id, 'yes')}
+                    onClick={() => setConfirmResolve('yes')}
                     className="px-2 py-1 border border-emerald-600 text-emerald-700 hover:bg-emerald-600 hover:text-white font-mono text-[10px] uppercase"
                   >
                     Resolve: Yes
                   </button>
                   <button
-                    onClick={() => act.resolveEvent(event.id, 'no')}
+                    onClick={() => setConfirmResolve('no')}
                     className="px-2 py-1 border border-rose-600 text-rose-700 hover:bg-rose-600 hover:text-white font-mono text-[10px] uppercase"
                   >
                     Resolve: No
@@ -1080,6 +1105,58 @@ function EventRow({ s, act, event, round, season, isAdmin }) {
           )}
         </div>
       </div>
+
+      {/* FIX (Bug #2, v0.2.0): admin-resolution confirmation panel */}
+      {confirmResolve && isAdmin && (
+        <div className="mt-3 border border-amber-300 bg-amber-50 p-3">
+          <div className="flex items-center gap-2 text-sm font-bold mb-2">
+            <AlertTriangle size={14} /> Resolve "{event.title}" as {confirmResolve.toUpperCase()}?
+          </div>
+          <div className="font-mono text-[10px] text-stone-700 space-y-1 mb-3">
+            <div>
+              <span className="text-stone-500">your_pick:</span>{' '}
+              <span className="font-bold">
+                {myPick ? myPick.choice.toUpperCase() : 'NO PICK'}
+              </span>
+              {myPick && myPick.choice !== confirmResolve && (
+                <span className="text-rose-700 ml-1">(differs from outcome)</span>
+              )}
+              {myPick && myPick.choice === confirmResolve && (
+                <span className="text-emerald-700 ml-1">(matches outcome)</span>
+              )}
+            </div>
+            <div>
+              <span className="text-stone-500">source_of_truth:</span>{' '}
+              <span className="text-stone-900">{league?.source_of_truth || '—'}</span>
+            </div>
+            <div className="text-stone-500 italic mt-2">
+              You're acting as both player and judge. The outcome you set should
+              match the source of truth, not your pick.
+            </div>
+          </div>
+          <div className="flex gap-2">
+            <button
+              onClick={() => {
+                act.resolveEvent(event.id, confirmResolve);
+                setConfirmResolve(null);
+              }}
+              className={`px-3 py-1 font-mono text-[10px] uppercase ${
+                confirmResolve === 'yes'
+                  ? 'bg-emerald-600 text-white'
+                  : 'bg-rose-600 text-white'
+              }`}
+            >
+              Confirm: resolve {confirmResolve}
+            </button>
+            <button
+              onClick={() => setConfirmResolve(null)}
+              className="px-3 py-1 font-mono text-[10px] text-stone-600"
+            >
+              cancel
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Show all members' picks once resolved (transparency) */}
       {resolved && (
@@ -1122,9 +1199,12 @@ function Leaderboard({ s, season }) {
     return participants
       .map((sp) => {
         const profile = s.profiles.find((p) => p.id === sp.user_id);
-        const total = sp.correct_picks_count + sp.wrong_picks_count;
-        const accuracy = total > 0 ? sp.correct_picks_count / total : 0;
-        return { ...sp, profile, accuracy };
+        // FIX (Bug #3, v0.2.0): accuracy excludes forfeits — measures pick
+        // quality on attempted events only. Forfeits are still penalized via
+        // credit deduction, just not double-counted in this metric.
+        const attempted = sp.correct_picks_count + sp.wrong_picks_count;
+        const accuracy = attempted > 0 ? sp.correct_picks_count / attempted : 0;
+        return { ...sp, profile, accuracy, forfeits: sp.forfeit_picks_count || 0 };
       })
       .sort((a, b) => {
         if (b.credits_remaining !== a.credits_remaining) return b.credits_remaining - a.credits_remaining;
@@ -1154,6 +1234,7 @@ function Leaderboard({ s, season }) {
               <th className="text-right">Credits</th>
               <th className="text-right">✓</th>
               <th className="text-right">✗</th>
+              <th className="text-right" title="Forfeits (no pick)">💀</th>
               <th className="text-right pr-1">Acc</th>
             </tr>
           </thead>
@@ -1176,6 +1257,7 @@ function Leaderboard({ s, season }) {
                   <td className="text-right py-1.5 font-mono tabular-nums font-bold">{r.credits_remaining}</td>
                   <td className="text-right py-1.5 font-mono tabular-nums text-emerald-700">{r.correct_picks_count}</td>
                   <td className="text-right py-1.5 font-mono tabular-nums text-rose-700">{r.wrong_picks_count}</td>
+                  <td className="text-right py-1.5 font-mono tabular-nums text-stone-500">{r.forfeits}</td>
                   <td className="text-right py-1.5 pr-1 font-mono tabular-nums text-stone-600">
                     {(r.accuracy * 100).toFixed(0)}%
                   </td>
@@ -1314,7 +1396,7 @@ function Footer() {
   return (
     <footer className="max-w-6xl mx-auto px-4 py-6 mt-8 border-t border-stone-200">
       <div className="font-mono text-[10px] text-stone-400 uppercase tracking-wider">
-        pepl.proto / mvp_phase_1 / starting_credits={MVP.STARTING_CREDITS} · loss_per_wrong={MVP.CREDIT_LOSS} · rounds_per_season={MVP.ROUNDS_PER_SEASON}
+        pepl.proto / v0.2.0 / starting_credits={MVP.STARTING_CREDITS} · loss_per_wrong={MVP.CREDIT_LOSS} · rounds_per_season={MVP.ROUNDS_PER_SEASON}
       </div>
       <div className="font-mono text-[10px] text-stone-400 mt-1">
         state persists across refreshes via window.storage. use RESET in header to wipe.
